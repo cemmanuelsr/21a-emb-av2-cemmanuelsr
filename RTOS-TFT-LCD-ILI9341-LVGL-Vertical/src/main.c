@@ -62,6 +62,13 @@ typedef struct  {
   uint32_t second;
 } calendar;
 
+typedef struct {
+	uint32_t hour;
+	uint32_t minute;
+	uint32_t second;
+	uint value;
+} xqueue_dado;
+
 #define LIST_LEN 5
 lv_obj_t * label_list[LIST_LEN];
 lv_obj_t * label_butOn;
@@ -70,8 +77,13 @@ lv_obj_t * mbox_alarm;
 
 QueueHandle_t xQueueRx;
 QueueHandle_t xQueueAdc;
+QueueHandle_t xQueueDados;
 TimerHandle_t xTimerAdc;
 
+char isOn = 1;
+uint32_t alarm_cnt = 0;
+SemaphoreHandle_t xSemaphoreAlarm, xSemaphoreOn;
+char alarm_create = 1;
 
 /************************************************************************/
 /* prototype                                                            */
@@ -90,13 +102,10 @@ void USART1_Handler(void){
   BaseType_t xHigherPriorityTaskWoken = pdTRUE;
   char c;
 
-  // Verifica por qual motivo entrou na interrup?cao
-  //  - Dadodispon?vel para leitura
   if(ret & US_IER_RXRDY){
     usart_serial_getchar(CONSOLE_UART, &c);
     xQueueSendFromISR(xQueueRx, (void *) &c, &xHigherPriorityTaskWoken);
 
-    // -  Transmissoa finalizada
     } else if(ret & US_IER_TXRDY){
 
   }
@@ -107,8 +116,9 @@ void USART1_Handler(void){
 /************************************************************************/
 
 static void btn_on_handler(lv_obj_t * obj, lv_event_t event) {
-  if(event == LV_EVENT_CLICKED) {
-    printf("Clicked\n");
+  if(event == LV_EVENT_LONG_PRESSED) {
+	isOn ? lv_label_set_text(label_butOn, "OFF") : lv_label_set_text(label_butOn, "ON");
+	isOn = !isOn;
   }
 }
 
@@ -194,17 +204,19 @@ static void task_uart(void *pvParameters) {
       if( p_cnt >= 32 ) {
         p_cnt = 0;
       }          
-      p_data[p_cnt++] = c; 
+      p_data[p_cnt++] = c;
       if (c == 'X'){
         p_do = 1;
-      }
+      } else if(c == 'C') {
+		  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+		  xSemaphoreGiveFromISR(xSemaphoreAlarm, &xHigherPriorityTaskWoken);
+	  }
     }
     
     if(p_do == 1) {
       p_cnt = 0;
       p_do = 0;
     }
-
   }
 }
 
@@ -224,10 +236,26 @@ static void task_process(void *pvParameters) {
   
   calendar rtc_initial = {2018, 3, 19, 12, 15, 45 ,1};
   RTC_init(RTC, ID_RTC, rtc_initial, NULL);
+  
+  int adc;
 
   while(1) {
-
+	if (xQueueReceiveFromISR( xQueueAdc, &(adc), ( TickType_t )  4000 / portTICK_PERIOD_MS) == pdTRUE) {
+		xqueue_dado xQueueData;
+		rtc_get_time(RTC, &xQueueData.hour, &xQueueData.minute, &xQueueData.second);
+		xQueueData.value = adc;
+		xQueueSend(xQueueDados, &xQueueData, 0);
+	}
   }
+}
+
+void slice_str(const char * str, char * buffer, size_t start, size_t end)
+{
+	size_t j = 0;
+	for ( size_t i = start; i <= end; ++i ) {
+		buffer[j++] = str[i];
+	}
+	buffer[j] = 0;
 }
 
 static void task_main(void *pvParameters) {
@@ -236,13 +264,50 @@ static void task_main(void *pvParameters) {
   lv_create_list();
   
   // TODO exemplo de alarme, deve ser removido
-  vTaskDelay(3000);
+  /*vTaskDelay(3000);
   lv_create_alarm();
   vTaskDelay(1000);
-  lv_obj_del(mbox_alarm);
+  lv_obj_del(mbox_alarm);*/
+  
+  xqueue_dado xQueueData;
   
   for (;;) {
-
+	if(alarm_cnt == 5) {
+		if(alarm_create) {
+			lv_create_alarm();
+			alarm_create = 0;
+		}
+		if(xSemaphoreTake(xSemaphoreAlarm, ( TickType_t ) 500 / portTICK_PERIOD_MS) == pdTRUE) {
+			lv_obj_del(mbox_alarm);
+			alarm_cnt = 0;
+			alarm_create = 1;
+		}
+	}
+	else if (xQueueReceiveFromISR( xQueueDados, &(xQueueData), ( TickType_t )  4000 / portTICK_PERIOD_MS) == pdTRUE) {
+		if(isOn) {
+			for (int i = LIST_LEN-1; i >= 0; i-- ){
+				if(i == 0) {
+					lv_label_set_text_fmt(label_list[i], "%d: %02d:%02d:%02d - %d", i, xQueueData.hour, xQueueData.minute, xQueueData.second, xQueueData.value);
+					if(xQueueData.value < 2000)
+						lv_obj_set_style_local_bg_color(label_list[i], LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_RED);
+					else if(xQueueData.value <= 3000)
+						lv_obj_set_style_local_bg_color(label_list[i], LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_YELLOW);
+					else
+						lv_obj_set_style_local_bg_color(label_list[i], LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, LV_COLOR_LIME);
+				}
+				else {
+					char * last_label = malloc(sizeof(char) * 20);
+					strcpy(last_label, lv_label_get_text(label_list[i-1]));
+					char * buffer[20];
+					slice_str(last_label, buffer, 1, strlen(last_label) - 1);
+					lv_label_set_text_fmt(label_list[i], "%d%s", i, buffer);
+					lv_obj_set_style_local_bg_color(label_list[i], LV_OBJ_PART_MAIN, LV_STATE_DEFAULT, lv_obj_get_style_bg_color(label_list[i-1], NULL));
+				}
+			}
+			if(xQueueData.value < 2000)
+				alarm_cnt++;
+		}
+	}
   }
 }
 
@@ -383,6 +448,8 @@ int main(void) {
   
   /* uart */
   xQueueRx = xQueueCreate(32, sizeof(char));
+  xQueueDados = xQueueCreate(32, sizeof(xqueue_dado));
+  xSemaphoreAlarm = xSemaphoreCreateBinary();
   USART1_init();
   configure_console();
 
